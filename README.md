@@ -1,4 +1,4 @@
-# Complex_and_Social_Networks
+# Homework CSN
 Homework carried out for the Complex and Social Networks course, Master's degree in Data Science, Universitat Politecnica de Catalunya, Academic Year 2025-26.
 
 ## Structure of the repository

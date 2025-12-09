@@ -1,0 +1,2232 @@
+---
+title: "LAB04"
+author: "Johannes, Gabriele Villa"
+date: "2025-11-08"
+output: html_document
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+```{r}
+#install.packages("patchwork")
+library(udpipe)
+library(igraph)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(minpack.lm)
+```
+
+
+
+
+```{r}
+# Function to calculate metrics for a single sentence
+calculate_sentence_metrics <- function(sentence_df) {
+  # n = number of nodes (tokens) in the sentence
+  n <- nrow(sentence_df)
+  
+  # Filter out rows with NA in token_id or head
+  sentence_df <- sentence_df[!is.na(sentence_df$token_id) & !is.na(sentence_df$head), ]
+  
+  # Convert to numeric
+  sentence_df$token_id <- as.numeric(sentence_df$token_id)
+  sentence_df$head <- as.numeric(sentence_df$head)
+  
+  # Remove rows where conversion failed
+  sentence_df <- sentence_df[!is.na(sentence_df$token_id) & !is.na(sentence_df$head), ]
+  
+  # Create graph from dependency tree (head = 0 is root)
+  edges <- sentence_df[sentence_df$head != 0, c("token_id", "head")]
+  
+  # Convert edge columns to character to avoid type issues
+  edges$token_id <- as.character(edges$token_id)
+  edges$head <- as.character(edges$head)
+  
+  # Create vertex list
+  vertices <- data.frame(name = as.character(sentence_df$token_id))
+  
+  # Create undirected graph
+  g <- graph_from_data_frame(edges, directed = FALSE, vertices = vertices)
+  
+  # Calculate degree for each node
+  degrees <- degree(g)
+  
+  # k^2 = degree second moment (mean of squared degrees)
+  k2 <- mean(degrees^2)
+  
+  # q -> number of vertices of odd degree
+  q <- sum(degrees %% 2 == 1)
+  
+  # ⟨d⟩ = average edge length (mean LINEAR distance between connected words)
+  # For each edge, calculate |token_id - head|
+  edges_numeric <- sentence_df[sentence_df$head != 0, c("token_id", "head")]
+  edge_lengths <- abs(edges_numeric$token_id - edges_numeric$head)
+  avg_d <- mean(edge_lengths)
+  
+  return(c(n = n, k2 = k2, avg_d = avg_d, q = q))
+}
+
+# Function to process a CoNLL-U file
+process_conllu_file <- function(input_file, output_file) {
+  # Read CoNLL-U file
+  conllu_data <- udpipe_read_conllu(input_file)
+  
+  # Get unique sentences
+  sentence_ids <- unique(conllu_data$sentence_id)
+  
+  # Calculate metrics for each sentence
+  results <- data.frame()
+  
+  for (sent_id in sentence_ids) {
+    sentence_df <- conllu_data[conllu_data$sentence_id == sent_id, ]
+    
+    # Filter only tokens (not multi-word tokens)
+    sentence_df <- sentence_df[!grepl("-", sentence_df$token_id), ]
+    
+    metrics <- calculate_sentence_metrics(sentence_df)
+    results <- rbind(results, metrics)
+  }
+  
+  # Assign column names
+  colnames(results) <- c("n", "k2", "avg_d", "q")
+  
+  without_q <- results[, c("n", "k2", "avg_d")]
+  
+  # Save results
+  write.table(without_q, output_file, 
+              row.names = FALSE, 
+              col.names = FALSE,
+              sep = "\t")
+  
+  return(results)
+}
+
+# Create data folder
+dir.create("data")
+
+# Find all .conllu files recursively in pud folder
+conllu_files <- list.files(path = "./pud", 
+                           pattern = "\\.conllu$", 
+                           full.names = TRUE, 
+                           recursive = TRUE)
+
+metric_dfs <- list()
+# Process each file
+for (file_path in conllu_files) {
+  # Extract language name from path (e.g., UD_English-PUD -> English)
+  lang_name <- gsub(".*UD_([^-]+)-PUD.*", "\\1", file_path)
+  
+  # Output file path
+  output_path <- file.path("data", paste0(lang_name, "_dependency_tree_metrics.txt"))
+  
+  # Process file
+  metric_df <- process_conllu_file(file_path, output_path)
+  metric_dfs[[lang_name]] <- metric_df
+}
+```
+
+```{r}
+# Function to validate metrics for a single sentence
+#validate_sentence <- function(n, k2, avg_d, degrees) {
+#  # Calculate q = number of vertices with odd degree
+#  q <- sum(degrees %% 2 == 1)
+#  
+#  # Check condition (1): 4 - 6/n ≤ k² ≤ n - 1
+#  lower_bound_1 <- 4 - 6/n
+#  upper_bound_1 <- n - 1
+#  valid_condition_1 <- (k2 >= lower_bound_1) & (k2 <= upper_bound_1)
+#  
+#  # Check condition (2): 1/4(n*k² + q) ≤ ⟨d⟩ ≤ 1/4(3(n-1)² + 1 - n mod 2)
+#  lower_bound_2 <- (1/4) * (n * k2 + q)
+#  upper_bound_2 <- (1/4) * (3 * (n - 1)^2 + 1 - (n %% 2))
+#  valid_condition_2 <- (avg_d*(n-1) >= lower_bound_2) & (avg_d*(n-1) <= upper_bound_2)
+#  
+#  return(list(
+#    valid_1 = valid_condition_1,
+#    valid_2 = valid_condition_2,
+#    q = q,
+#    lower_1 = lower_bound_1,
+#    upper_1 = upper_bound_1,
+#    lower_2 = lower_bound_2,
+#    upper_2 = upper_bound_2
+#  ))
+#}
+
+# Function to check all sentences in a metrics df
+check_metrics <- function(metrics, language_name) {
+  # Read metrics file
+#  metrics <- read.table(metrics_file, header = FALSE, col.names = c("n", "k2", "avg_d"))
+  
+  total_sentences <- nrow(metrics)
+  valid_count_1 <- 0
+  valid_count_2 <- 0
+  invalid_sentences <- list()
+  
+  # Iterate over each row
+  for (i in 1:nrow(metrics)) {
+    n <- metrics$n[i]
+    k2 <- metrics$k2[i]
+    avg_d <- metrics$avg_d[i]
+    
+    # For validation we need degrees, recalculate from original file
+    # For now, estimate q based on tree properties
+    # In a tree: sum of degrees = 2(n-1), so average degree = 2(n-1)/n
+    # We approximate q for validation
+    # estimated_q <- n %% 2  # Simplified estimation
+    q <- metrics$q[i]
+    # Validate conditions
+    lower_1 <- 4 - 6/n
+    upper_1 <- n - 1
+    valid_1 <- (k2 >= lower_1) & (k2 <= upper_1)
+    
+    #lower_2 <- (1/4) * (n * k2 + estimated_q)
+    lower_2 <- (1/4) * (n * k2 + q)
+    upper_2 <- (1/4) * (3 * (n - 1)^2 + 1 - (n %% 2))
+    valid_2 <- (avg_d*(n-1) >= lower_2) & (avg_d*(n-1) <= upper_2)
+    
+    if (valid_1) valid_count_1 <- valid_count_1 + 1
+    if (valid_2) valid_count_2 <- valid_count_2 + 1
+    
+    # Store invalid sentences for reporting
+    if (!valid_1 | !valid_2) {
+      invalid_sentences[[length(invalid_sentences) + 1]] <- list(
+        sentence = i,
+        n = n,
+        k2 = k2,
+        avg_d = avg_d,
+        valid_1 = valid_1,
+        valid_2 = valid_2,
+        bounds_1 = c(lower_1, upper_1),
+        bounds_2 = c(lower_2, upper_2)
+      )
+    }
+  }
+  
+  # Print summary
+  cat("\n=== Validation Results for", language_name, "===\n")
+  cat("Total sentences:", total_sentences, "\n")
+  cat("Valid condition (1):", valid_count_1, "/", total_sentences, 
+      sprintf("(%.2f%%)", 100 * valid_count_1 / total_sentences), "\n")
+  cat("Valid condition (2):", valid_count_2, "/", total_sentences,
+      sprintf("(%.2f%%)", 100 * valid_count_2 / total_sentences), "\n")
+  both_valid <- total_sentences - length(invalid_sentences)
+cat("Both conditions valid:", both_valid, "/", total_sentences, "\n")
+  
+  # Return detailed results
+  return(list(
+    total = total_sentences,
+    valid_1 = valid_count_1,
+    valid_2 = valid_count_2,
+    invalid = invalid_sentences
+  ))
+}
+
+# Main validation script
+validate_all_languages <- function() {
+  # Find all metric files
+ # metric_files <- list.files(path = "./data", 
+  #                           pattern = "_dependency_tree_metrics\\.txt$",
+   #                          full.names = TRUE)
+  
+  # Store all results
+  all_results <- list()
+  
+  # Process each file
+  for (lang_name in names(metric_dfs)) {
+    df <- metric_dfs[[lang_name]]
+    # Extract language name
+    #lang_name <- gsub(".*/(\\w+)_dependency_tree_metrics\\.txt", "\\1", file_path)
+    
+    # Validate metrics
+    #results <- check_metrics_file(file_path, lang_name)
+    results <- check_metrics(df, lang_name)
+    all_results[[lang_name]] <- results
+  }
+  
+  # Overall summary
+  cat("\n\n=== OVERALL SUMMARY ===\n")
+  total_all <- sum(sapply(all_results, function(x) x$total))
+  valid_1_all <- sum(sapply(all_results, function(x) x$valid_1))
+  valid_2_all <- sum(sapply(all_results, function(x) x$valid_2))
+  
+  cat("Total sentences across all languages:", total_all, "\n")
+  cat("Valid condition (1):", valid_1_all, "/", total_all,
+      sprintf("(%.2f%%)", 100 * valid_1_all / total_all), "\n")
+  cat("Valid condition (2):", valid_2_all, "/", total_all,
+      sprintf("(%.2f%%)", 100 * valid_2_all / total_all), "\n")
+  
+  return(all_results)
+}
+
+# Run validation
+results <- validate_all_languages()
+```
+
+
+```{r}
+files <- list.files("data")
+
+summary_df <- data.frame()
+lang_tbl_list = list()
+
+for (file in files) {
+  lang_tbl <- read.table(paste0("./data/", file), header = FALSE)
+  colnames(lang_tbl) = c("vertices","degree_2nd_moment", "mean_length")
+  lang <- sub("_.*", "", file)
+  lang_tbl_list[[lang]] =  lang_tbl[order(lang_tbl$vertices), ]
+  
+  N <- dim(lang_tbl)[1]
+  mu_n <- mean(lang_tbl$vertices)
+  std_n <- sd(lang_tbl$vertices)
+  
+  mu_d <- mean(lang_tbl$mean_length)
+  std_d <- sd(lang_tbl$mean_length)
+  
+
+  summary_df=rbind(summary_df, c(lang,N,mu_n,std_n,mu_d,std_d))
+  colnames(summary_df) = c('Language', 'N', 'mu_n', 'std_n', 'mu_d', 'std_d')
+}
+languages <- names(lang_tbl_list)
+summary_df
+```
+
+```{r}
+lang_tbl_list[['Arabic']]
+```
+
+```{r}
+plot_lang <- function(lang, plot_agg=F, lines=F, onerow=F) {
+  if(plot_agg || lines) {
+    agg_data <- aggregate(lang_tbl_list[[lang]], list(lang_tbl_list[[lang]]$vertices), mean)
+  }
+  if(plot_agg) {
+    data <- agg_data
+    y_lab = "mean of mean dependency length"
+  } else {
+    data <- lang_tbl_list[[lang]]
+    y_lab = "mean dependency length"
+  }
+  y_lim <- range(data$mean_length, na.rm = TRUE)
+  
+  base_plot <- ggplot(data, aes(x = vertices, y = mean_length)) +
+    geom_point() +
+    labs(x = "vertices", y = y_lab) +
+    coord_cartesian(ylim = y_lim) +
+     theme(aspect.ratio = 1) 
+  
+  if(lines) {
+    base_plot <- base_plot +
+      geom_line(aes(y = (vertices + 1) / 3, colour = "Random Expectation: (vertices+1)/3"), linetype = "dashed") +
+      geom_line(data = agg_data, aes(x = vertices, y = mean_length, colour = "Empirical Mean"), linewidth = 1) +
+      scale_color_manual(name = NULL, values = c("Empirical Mean" = "green", "Random Expectation: (vertices+1)/3" = "red"))
+  }
+  
+  lin_lin <- base_plot +
+    ggtitle(paste(lang, "- Lin-Lin Scale"))
+  
+  log_lin <- base_plot +
+    scale_x_log10() +
+    ggtitle(paste(lang, "- Log-Lin Scale"))
+  
+  lin_log <- base_plot +
+    scale_y_log10() +
+    ggtitle(paste(lang, "- Lin-Log Scale"))
+  
+  log_log <- base_plot +
+    scale_x_log10() +
+    scale_y_log10() +
+    ggtitle(paste(lang, "- Log-Log Scale"))
+ 
+  if (onerow) {
+    combined_plot <- lin_lin | log_lin | lin_log | log_log
+  } else {
+  combined_plot <- (lin_lin | log_lin) / (lin_log | log_log)
+  }
+  
+  return(combined_plot)
+}
+```
+
+```{r, fig.width=10, fig.height=8}
+#ggplot(lang_tbl_list[['English']], aes(vertices, mean_length)) +
+#geom_point() +
+#scale_x_log10() +
+#scale_y_log10() +
+#labs(x = "vertices", y = "mean dependency length")
+
+plot <- plot_lang("English", plot_agg = F, lines = T)
+plot  &
+  theme(legend.position = "top")
+```
+
+```{r, fig.width=16, fig.height=24}
+lang_plots <- lapply(
+  languages[1:6],
+  function(l) plot_lang(l, plot_agg = FALSE, lines = TRUE, onerow=T)
+)
+
+prelim_all <- wrap_plots(lang_plots, ncol = 1, guides = "collect") &
+  theme(legend.position = "top")
+
+prelim_all
+```
+```{r, fig.width=16, fig.height=24}
+lang_plots2 <- lapply(
+  languages[7:12],
+  function(l) plot_lang(l, plot_agg = FALSE, lines = TRUE, onerow=T)
+)
+
+prelim_all2 <- wrap_plots(lang_plots2, ncol = 1, guides = "collect") &
+  theme(legend.position = "top")
+prelim_all2
+```
+
+```{r, fig.width=16, fig.height=24}
+lang_plots3 <- lapply(
+  languages[13:18],
+  function(l) plot_lang(l, plot_agg = FALSE, lines = TRUE, onerow=T)
+)
+prelim_all3 <- wrap_plots(lang_plots3, ncol = 1, guides = "collect") &
+  theme(legend.position = "top")
+prelim_all3
+```
+
+```{r, fig.width=16, fig.height=12.1}
+lang_plots4 <- lapply(
+  languages[19:length(languages)],
+  function(l) plot_lang(l, plot_agg = FALSE, lines = TRUE, onerow=T)
+)
+prelim_all4 <- wrap_plots(lang_plots4, ncol = 1, guides = "collect") &
+  theme(legend.position = "top")
+prelim_all4
+```
+
+
+
+```{r}
+#mean_English = aggregate(lang_tbl_list[['English']], list(lang_tbl_list[['English']]$vertices), mean)
+#
+#ggplot(mean_English, aes(x = vertices, y = mean_length)) +
+#  geom_point() +
+#  labs(x = "vertices", y = "mean mean dependency length")
+```
+
+```{r}
+#ggplot(mean_English, aes(x = vertices, y = mean_length)) +
+#  geom_point() +
+#  scale_x_log10() +
+#  scale_y_log10() +
+#  labs(x = "vertices", y = "mean mean dependency length")
+```
+
+```{r}
+# lines_df <- data.frame(
+#   vertices = c(mean_English$vertices, mean_English$vertices),
+#   y = c(mean_English$mean_length, (mean_English$vertices+1)/3),
+#   line = rep(c("mean_length", "(vertices+1)/3"), each = nrow(mean_English))
+# )
+# 
+# ggplot() +
+#   geom_point(data = lang_tbl_list[["English"]], aes(x = vertices, y = mean_length)) +
+#   geom_line(data = lines_df, aes(x = vertices, y = y, color = line), linewidth = 1) +
+#   scale_color_manual(values = c("mean_length" = "green", "(vertices+1)/3" = "red")) +
+#   scale_x_log10() +
+#   scale_y_log10() +
+#   labs(x = "vertices", y = "mean dependency length", color = "Line")
+```
+
+## Homocedasticity check
+
+```{r, fig.width=10, fig.height=20}
+#var_of_n_tbl <- function(lang, min_n_points=10) {
+#  var_table <- lang_tbl_list[[lang]] %>%
+#    group_by(vertices) %>%
+#    summarise(
+#      var_y = var(mean_length),
+#      n_points = n()
+#    )
+#  
+#  var_table_filtered <- var_table %>%
+#    filter(n_points >= min_n_points)
+#  
+#  return(var_table_filtered)
+#}
+#
+#coefs <- data.frame()
+#
+#homosc_check <- function(lang, min_n_points = 5) {
+#  vt <- var_of_n_tbl(lang, min_n_points)
+#
+#  fit_var <- lm(log10(var_y) ~ log10(vertices),
+#                data = vt,
+#                weights = n_points)
+#
+#  beta  <- coef(fit_var)[2]
+#  alpha <- coef(fit_var)[1]
+#  coefs <<- rbind(coefs, data.frame(Language = lang, Beta = beta, Alpha = alpha))
+#
+#  ggplot(vt, aes(x = vertices, y = var_y)) +
+#    geom_point() +
+#    # log–log axes
+#    scale_x_log10() +
+#    scale_y_log10() +
+#    # fitted power-law line: log10(var_y) = alpha + beta * log10(vertices)
+#    geom_abline(intercept = alpha, slope = beta, colour = "red") +
+#    labs(
+#      title = paste0(lang, " (β = ", sprintf("%.3f", beta), ")"),
+#      x     = "vertices (n)",
+#      y     = "Var(<d>) | n)"
+#    ) + 
+#    coord_fixed() +
+#    theme(aspect.ratio = 1)
+#}
+#
+#langs  <- names(lang_tbl_list)
+#plot_list <- lapply(langs, homosc_check)
+#print(coefs)
+#wrap_plots(plot_list, ncol = 4)
+## Homoscedasticity check ---------------------------------------------
+
+var_of_n_tbl <- function(lang, min_n_points = 10) {
+  lang_tbl_list[[lang]] %>%
+    dplyr::group_by(vertices) %>%
+    dplyr::summarise(
+      var_y    = var(mean_length),
+      n_points = dplyr::n(),
+      .groups  = "drop"
+    ) %>%
+    dplyr::filter(n_points >= min_n_points)
+}
+
+homosc_check <- function(lang, min_n_points = 5) {
+  vt <- var_of_n_tbl(lang, min_n_points = min_n_points)
+  
+  fit_var <- lm(
+    log10(var_y) ~ log10(vertices),
+    data    = vt,
+    weights = n_points
+  )
+  
+  s <- summary(fit_var)
+  cf <- coef(s)
+  
+  beta  <- cf["log10(vertices)", "Estimate"]
+  alpha <- cf["(Intercept)",      "Estimate"]
+  se_b  <- cf["log10(vertices)", "Std. Error"]
+  t_b   <- cf["log10(vertices)", "t value"]
+  p_b   <- cf["log10(vertices)", "Pr(>|t|)"]
+  
+  ci    <- confint(fit_var, "log10(vertices)", level = 0.95)
+  ci_low  <- ci[1]
+  ci_high <- ci[2]
+
+  
+  stats <- data.frame(
+    Language   = lang,
+    Beta       = beta,
+    Alpha      = alpha,
+    SE_Beta    = se_b,
+    t_Beta     = t_b,
+    p_Beta     = p_b,
+    CI_low     = ci_low,
+    CI_high    = ci_high,
+    stringsAsFactors = FALSE
+  )
+  
+  plot_var <- ggplot(vt, aes(x = vertices, y = var_y)) +
+    geom_point() +
+    scale_x_log10() +
+    scale_y_log10() +
+    geom_abline(intercept = alpha, slope = beta, colour = "red") +
+    labs(
+      title = paste0(lang, " (β = ", sprintf("%.3f", beta), ")"),
+      x = "vertices (n)",
+      y = "Var(<d> | n)"
+    ) +
+    coord_fixed() +
+    theme(aspect.ratio = 1)
+  
+  list(plot = plot_var, stats = stats)
+}
+
+langs <- names(lang_tbl_list)
+
+res_list <- lapply(langs, homosc_check, min_n_points = 5)
+
+plot_list <- lapply(res_list, `[[`, "plot")
+stats_tbl <- do.call(rbind, lapply(res_list, `[[`, "stats"))
+
+
+print(stats_tbl)
+wrap_plots(plot_list, ncol = 4)
+```
+
+# Model Fitting
+
+```{r}
+AGGREGATED <- TRUE
+
+agg_lang_tbl_list <- list()
+for(lang in names(lang_tbl_list)) {
+  agg_lang_tbl_list[[lang]] <- aggregate(mean_length ~ vertices, data = lang_tbl_list[[lang]], FUN = mean)
+}
+languages <- names(agg_lang_tbl_list)
+
+if (AGGREGATED) {
+  data_list <- agg_lang_tbl_list # CHANGE HERE TO lang_tbl_list TO FIT ON RAW DATA
+} else {
+  data_list <- lang_tbl_list
+}
+#
+#if (FILTERED) {
+#  min_n <- 5
+#
+#  valid_vertices_list <- lapply(lang_tbl_list, function(df) {
+#    tab <- table(df$vertices)
+#    as.numeric(names(tab[tab >= min_n]))
+#  })
+#
+#  for (lang in languages) {
+#    keep_vertices <- valid_vertices_list[[lang]]
+#    data_list[[lang]] <- subset(
+#      data_list[[lang]],
+#      vertices %in% keep_vertices
+#    )
+#  }
+#}
+```
+
+## Model 0
+
+```{r}
+s_0 <- c()
+AIC_0 <- c()
+BIC_0 <- c()
+
+for (lang in languages) {
+  data <- data_list[[lang]]
+  
+  RSS <- sum((data$mean_length-(data$vertices+1)/3)^2)
+  n <- length(data$vertices)
+  p <- 0
+  s <- sqrt(RSS/(n - p))
+  AIC <- n*log(2*pi) + n*log(RSS/n) + n + 2*(p + 1)
+  BIC <- n*log(2*pi) + n*log(RSS/n) + n + log(n)*(p + 1)
+  
+  s_0[lang]   <- s
+  AIC_0[lang] <- AIC
+  BIC_0[lang] <- BIC
+}
+
+model0_results <- data.frame(
+  Language = names(s_0),
+  s_0      = as.numeric(s_0),
+  AIC_0    = as.numeric(AIC_0),
+  BIC_0    = as.numeric(BIC_0)
+)
+model0_results
+```
+
+## Model 1 and 1+
+
+```{r}
+#AIC_1 = c()
+#s_1 = c()
+#b_1 = c()
+#AIC_1_plus = c()
+#s_1_plus = c()
+#b_1_plus = c()
+#d_1_plus = c()
+#
+#for (lang in languages) {
+#  linear_model = lm(log(mean_length)~log(vertices/2), lang_tbl_list[[lang]])
+#  b_initial = exp(coef(linear_model)[1])
+#
+#  nonlinear_model = nls(mean_length~(vertices/2)^b,data=lang_tbl_list[[lang]], start = list(b = b_initial), trace = FALSE) 
+#  
+#  s_1 = c(s_1, round(sqrt(deviance(nonlinear_model)/df.residual(nonlinear_model)),4))
+#  AIC_1 = c(AIC_1, round(AIC(nonlinear_model),2))
+#  b_1 = c(b_1, round(coef(nonlinear_model)["b"],4))
+#  
+#  nonlinear_model_plus = nls(mean_length~(vertices/2)^b + d,data=lang_tbl_list[[lang]], start = list(b = b_initial, d = 0), trace = FALSE) 
+#  
+#  AIC_1_plus = c(AIC_1_plus, round(AIC(nonlinear_model_plus),2))
+#  s_1_plus = c(s_1_plus, round(sqrt(deviance(nonlinear_model_plus)/df.residual(nonlinear_model_plus)),4))
+#  b_1_plus = c(b_1_plus, round(coef(nonlinear_model_plus)["b"],4))
+#  d_1_plus = c(d_1_plus, round(coef(nonlinear_model_plus)["d"],4))
+#}
+```
+
+## model 1
+
+```{r}
+AIC_1 <- c()
+s_1 <- c()
+b_1 <- c()
+BIC_1 = c()
+
+for (lang in languages) {
+  data <- data_list[[lang]]
+
+  init_lm <- lm(log(mean_length) ~ 0 + log(vertices/2), data = data)
+  b_init <- coef(init_lm)[1]
+  
+  m1 <- nls(mean_length ~ (vertices/2)^b, data = data, start = list(b = b_init))
+  
+  s_1[lang] <-  sqrt(deviance(m1)/df.residual(m1))
+  AIC_1[lang] <- AIC(m1)
+  b_1[lang] <- coef(m1)["b"]
+  BIC_1[lang] = BIC(m1)
+}
+
+model1_results <- data.frame(
+  Language = names(s_1),
+  s_1      = as.numeric(s_1),
+  AIC_1    = as.numeric(AIC_1),
+  b_1      = as.numeric(b_1),
+  BIC_1    = as.numeric(BIC_1)
+)
+model1_results
+```
+
+## m1 plus
+
+```{r}
+AIC_1_plus <- c()
+s_1_plus <- c()
+b_1_plus <- c()
+d_1_plus <- c()
+BIC_1_plus = c()
+
+for (lang in languages) {
+  data <- data_list[[lang]]
+  
+  b_init <- b_1[lang]
+  
+  #f_m1 <- (data$vertices/2)^b_init
+  #d_init <- mean(data$mean_length - f_m1)
+  
+  m1_plus <- tryCatch(
+    {
+      nlsLM(
+        mean_length ~ (vertices/2)^b + d,
+        data = data,
+        start = list(b = b_init, d = 0),
+        control = nls.lm.control(maxiter = 1000)
+      )
+    },
+    error = function(e) {
+      message("nlsLM failed for language: ", lang)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(m1_plus)) {
+    s_1_plus[lang]    <- NA_real_
+    AIC_1_plus[lang]  <- NA_real_
+    b_1_plus[lang]    <- NA_real_
+    d_1_plus[lang]    <- NA_real_
+    BIC_1_plus[lang]  <- NA_real_
+    next
+  }
+  
+  coeffs <- coef(m1_plus)
+  
+  s_1_plus[lang] <- sqrt(deviance(m1_plus)/df.residual(m1_plus))
+  AIC_1_plus[lang] <- AIC(m1_plus)
+  b_1_plus[lang] <- coeffs[1]
+  d_1_plus[lang] <- coeffs[2]
+  BIC_1_plus[lang] <- BIC(m1_plus)
+}
+
+model1_plus_results <- data.frame(
+  Language = names(s_1_plus),
+  s_1_plus = as.numeric(s_1_plus),
+  AIC_1_plus = as.numeric(AIC_1_plus),
+  b_1_plus = as.numeric(b_1_plus),
+  d_1_plus = as.numeric(d_1_plus),
+  BIC_1_plus = as.numeric(BIC_1_plus)
+)
+model1_plus_results
+```
+
+## Model 2
+
+```{r}
+#AIC_2 = c()
+#s_2 = c()
+#a_2 = c()
+#b_2 = c()
+#AIC_2_plus = c()
+#s_2_plus = c()
+#a_2_plus = c()
+#b_2_plus = c()
+#d_2_plus = c()
+#
+#for (lang in languages) {
+#  linear_model = lm(log(mean_length)~log(vertices), lang_tbl_list[[lang]])
+#  a_initial = exp(coef(linear_model)[1])
+#  b_initial = coef(linear_model)[2]
+#  
+#  nonlinear_model = nls(mean_length~a*vertices^b,data=lang_tbl_list[[lang]], start = list(a = a_initial, b = b_initial), trace = FALSE) 
+#  
+#  s_2 = c(s_2, round(sqrt(deviance(nonlinear_model)/df.residual(nonlinear_model)),4))
+#  AIC_2 = c(AIC_2, round(AIC(nonlinear_model),2))
+#  a_2 = c(a_2, round(coef(nonlinear_model)["a"],4))
+#  b_2 = c(b_2, round(coef(nonlinear_model)["b"],4))
+#  
+#  
+#  nonlinear_model_plus = nls(mean_length~a*vertices^b + d,data=lang_tbl_list[[lang]], start = list(a = a_initial, b = b_initial, d=0), trace = FALSE, control = nls.control(maxiter = 10000, #minFactor = 1e-10))
+#
+#  s_2_plus = c(s_2_plus, round(sqrt(deviance(nonlinear_model_plus)/df.residual(nonlinear_model_plus)),4))
+#  AIC_2_plus = c(AIC_2_plus, round(AIC(nonlinear_model_plus),2))
+#  a_2_plus = c(a_2_plus, round(coef(nonlinear_model_plus)["a"],4))
+#  b_2_plus = c(b_2_plus, round(coef(nonlinear_model_plus)["b"],4))
+#  d_2_plus = c(d_2_plus, round(coef(nonlinear_model_plus)["d"],4))
+#}
+```
+
+## MODEL 2
+
+```{r}
+AIC_2 <- c()
+s_2 <- c()
+a_2 <- c()
+b_2 <- c()
+BIC_2 <- c()
+
+for (lang in languages) {
+  data <- data_list[[lang]]
+  
+  lin <- lm(log(mean_length) ~ log(vertices), data = data <- data_list[[lang]])
+  a_init <- exp(coef(lin)[1])
+  b_init <- coef(lin)[2]
+  
+  m2 <- nls(mean_length ~ a * vertices^b,
+                         data = data,
+                         start = list(a = a_init, b = b_init),
+                         trace = FALSE)
+  
+  s_2[lang] <- sqrt(deviance(m2)/df.residual(m2))
+  AIC_2[lang] <- AIC(m2)
+  a_2[lang] <- coef(m2)["a"]
+  b_2[lang] <- coef(m2)["b"]
+  BIC_2[lang] <- BIC(m2)
+}
+
+model2_results <- data.frame(
+  Language = names(s_2),
+  s_2 = as.numeric(s_2),
+  AIC_2 = as.numeric(AIC_2),
+  a_2 = as.numeric(a_2),
+  b_2 = as.numeric(b_2),
+  BIC_2 = as.numeric(BIC_2)
+)
+model2_results
+```
+
+## m2+
+
+```{r}
+AIC_2_plus <- c()
+s_2_plus <- c()
+a_2_plus <- c()
+b_2_plus <- c()
+d_2_plus <- c()
+BIC_2_plus <- c()
+
+for(lang in languages) {
+  data <- data_list[[lang]]
+  
+  a_init <- a_2[lang]
+  b_init <- b_2[lang]
+  
+  #f_m2 <- a_init * data$vertices^b_init
+  #d_init <- mean(data$mean_length - f_m2)
+  
+  m2_plus <- tryCatch(
+    {
+      nlsLM(
+        mean_length ~ a * vertices^b + d,
+        data    = data,
+        start   = list(a = a_init, b = b_init, d = 0),
+        control = nls.lm.control(maxiter = 1000)
+      )
+    },
+    error = function(e) {
+      message("nlsLM failed for language: ", lang)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(m2_plus)) {
+    s_2_plus[lang]    <- NA_real_
+    AIC_2_plus[lang]  <- NA_real_
+    a_2_plus[lang]    <- NA_real_
+    b_2_plus[lang]    <- NA_real_
+    d_2_plus[lang]    <- NA_real_
+    BIC_2_plus[lang]  <- NA_real_
+    next
+  }
+  
+  coeffs <- coef(m2_plus)
+  
+  s_2_plus[lang]   <- sqrt(deviance(m2_plus) / df.residual(m2_plus))
+  AIC_2_plus[lang] <- AIC(m2_plus)
+  a_2_plus[lang]   <- coeffs[1]
+  b_2_plus[lang]   <- coeffs[2]
+  d_2_plus[lang]   <- coeffs[3]
+  BIC_2_plus[lang] <- BIC(m2_plus)
+}
+
+model2_plus_results <- data.frame(
+  Language = names(s_2_plus),
+  s_2_plus = as.numeric(s_2_plus),
+  AIC_2_plus = as.numeric(AIC_2_plus),
+  a_2_plus = as.numeric(a_2_plus),
+  b_2_plus = as.numeric(b_2_plus),
+  d_2_plus = as.numeric(d_2_plus),
+  BIC_2_plus = as.numeric(BIC_2_plus)
+)
+model2_plus_results
+```
+
+## Model 3
+
+```{r}
+#AIC_3 = c()
+#s_3 = c()
+#a_3 = c()
+#c_3 = c()
+#AIC_3_plus = c()
+#s_3_plus = c()
+#a_3_plus = c()
+#c_3_plus = c()
+#d_3_plus = c()
+#
+#for (lang in languages) {
+#  linear_model = lm(log(mean_length)~vertices, lang_tbl_list[[lang]])
+#  a_initial = exp(coef(linear_model)[1])
+#  c_initial = coef(linear_model)[2]
+#  
+#  nonlinear_model = nls(mean_length~a*exp(vertices*c),data=lang_tbl_list[[lang]], start = list(a = a_initial, c = c_initial), trace = FALSE) 
+#  
+#  s_3 = c(s_3, round(sqrt(deviance(nonlinear_model)/df.residual(nonlinear_model)),4))
+#  AIC_3 = c(AIC_3, round(AIC(nonlinear_model),2))
+#  a_3 = c(a_3, round(coef(nonlinear_model)["a"],4))
+#  c_3 = c(c_3, round(coef(nonlinear_model)["c"],4))
+#  
+#  
+#  nonlinear_model_plus = nls(mean_length~a*exp(vertices*c) + d,data=lang_tbl_list[[lang]], start = list(a = a_initial, c = c_initial, d=0), trace = FALSE, control = nls.control(maxiter = #10000, minFactor = 1e-10)) # DOES NOT CONVERGE
+#
+#  s_3_plus = c(s_3_plus, round(sqrt(deviance(nonlinear_model_plus)/df.residual(nonlinear_model_plus)),4))
+#  AIC_3_plus = c(AIC_3_plus, round(AIC(nonlinear_model_plus),2))
+#  a_3_plus = c(a_3_plus, round(coef(nonlinear_model_plus)["a"],4))
+#  c_3_plus = c(c_3_plus, round(coef(nonlinear_model_plus)["c"],4))
+#  d_3_plus = c(d_3_plus, round(coef(nonlinear_model_plus)["d"],4))
+#}
+```
+
+## MODEL 3
+
+```{r}
+AIC_3 <- c()
+s_3 <- c()
+a_3 <- c()
+c_3 <- c()
+BIC_3 <- c()
+
+for (lang in languages) {
+  data <- data_list[[lang]]
+  
+  lin <- lm(log(mean_length) ~ vertices, data = data)
+  a_init <- exp(coef(lin)[1])
+  c_init <- coef(lin)[2] 
+  
+  m3 <- nls(mean_length ~ a * exp(vertices * c),
+                         data = data,
+                         start = list(a = a_init, c = c_init),
+                         trace = FALSE)
+  s_3[lang] <- sqrt(deviance(m3)/df.residual(m3))
+  AIC_3[lang] <- AIC(m3)
+  a_3[lang] <- coef(m3)["a"]
+  c_3[lang] <- coef(m3)["c"]
+  BIC_3[lang] <- BIC(m3)
+}
+model3_results <- data.frame(
+  Language = names(s_3),
+  s_3 = as.numeric(s_3),
+  AIC_3 = as.numeric(AIC_3),
+  a_3 = as.numeric(a_3),
+  c_3 = as.numeric(c_3),
+  BIC_3 = as.numeric(BIC_3)
+)
+model3_results
+```
+
+## m3+
+
+```{r}
+AIC_3_plus <- c()
+s_3_plus <- c()
+a_3_plus <- c()
+c_3_plus <- c()
+d_3_plus <- c()
+BIC_3_plus <- c()
+
+for (lang in languages) {
+  data <- data_list[[lang]]
+  
+  a_init <- a_3[lang]
+  c_init <- c_3[lang]
+  
+  #f_m3 <- a_init * exp(c_init*data$vertices)
+  #d_init <- mean(data$mean_length - f_m3)
+  
+  m3_plus <- tryCatch(
+    {
+      nlsLM(
+        mean_length ~ a * exp(vertices * c) + d,
+        data = data,
+        start = list(a = a_init, c = c_init, d = 0),
+        control = nls.lm.control(maxiter = 1000)
+      )
+    },
+    error = function(e) {
+      message("nlsLM failed for language: ", lang)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(m3_plus)) {
+    s_3_plus[lang]    <- NA_real_
+    AIC_3_plus[lang]  <- NA_real_
+    a_3_plus[lang]    <- NA_real_
+    c_3_plus[lang]    <- NA_real_
+    d_3_plus[lang]    <- NA_real_
+    BIC_3_plus[lang]  <- NA_real_
+    next
+  }
+  
+  coeffs <- coef(m3_plus)
+  
+  s_3_plus[lang] <- sqrt(deviance(m3_plus)/df.residual(m3_plus))
+  AIC_3_plus[lang] <- AIC(m3_plus)
+  a_3_plus[lang] <- coeffs[1]
+  c_3_plus[lang] <- coeffs[2]
+  d_3_plus[lang] <- coeffs[3]
+  BIC_3_plus[lang] <- BIC(m3_plus)
+}
+
+model3_plus_results <- data.frame(
+  Language = names(s_3_plus),
+  s_3_plus = as.numeric(s_3_plus),
+  AIC_3_plus = as.numeric(AIC_3_plus),
+  a_3_plus = as.numeric(a_3_plus),
+  c_3_plus = as.numeric(c_3_plus),
+  d_3_plus = as.numeric(d_3_plus),
+  BIC_3_plus = as.numeric(BIC_3_plus)
+)
+model3_plus_results
+```
+
+## Model 4 and 4+
+
+```{r}
+#AIC_4 = c()
+#s_4 = c()
+#a_4 = c()
+#AIC_4_plus = c()
+#s_4_plus = c()
+#a_4_plus = c()
+#d_4_plus = c()
+#
+#for (lang in languages) {
+#  linear_model = lm(mean_length~log(vertices), lang_tbl_list[[lang]])
+#  a_initial = coef(linear_model)[1]
+#  
+#  nonlinear_model = nls(mean_length~a*log(vertices),data=lang_tbl_list[[lang]], start = list(a = a_initial), trace = FALSE) 
+#  
+#  s_4 = c(s_4, round(sqrt(deviance(nonlinear_model)/df.residual(nonlinear_model)),4))
+#  AIC_4 = c(AIC_4, round(AIC(nonlinear_model),2))
+#  a_4 = c(a_4, round(coef(nonlinear_model)["a"],4))
+#  
+#  
+#  nonlinear_model_plus = nls(mean_length~a*log(vertices) + d,data=lang_tbl_list[[lang]], start = list(a = a_initial, d=0), trace = FALSE) 
+#  
+#  s_4_plus = c(s_4_plus, round(sqrt(deviance(nonlinear_model_plus)/df.residual(nonlinear_model_plus)),4))
+#  AIC_4_plus = c(AIC_4_plus, round(AIC(nonlinear_model_plus),2))
+#  a_4_plus = c(a_4_plus, round(coef(nonlinear_model_plus)["a"],4))
+#  d_4_plus = c(d_4_plus, round(coef(nonlinear_model_plus)["d"],4))
+#}
+```
+
+## model 4
+
+```{r}
+AIC_4 <- c()
+s_4 <- c()
+a_4 <- c()
+BIC_4 <- c()
+
+for (lang in languages) {
+  data <- data_list[[lang]]
+
+  lin <- lm(mean_length ~ log(vertices), data = data)
+  a_init <- coef(lin)[1]
+  
+  m4 <- nls(mean_length ~ a * log(vertices),
+                         data = data,
+                         start = list(a = a_init),
+                         trace = FALSE)
+  
+  s_4[lang] <- sqrt(deviance(m4)/df.residual(m4))
+  AIC_4[lang] <- AIC(m4)
+  a_4[lang] <- coef(m4)["a"]
+  BIC_4[lang] <- BIC(m4)
+}
+model4_results <- data.frame(
+  Language = names(s_4),
+  s_4 = as.numeric(s_4),
+  AIC_4 = as.numeric(AIC_4),
+  a_4 = as.numeric(a_4),
+  BIC_4 = as.numeric(BIC_4)
+)
+model4_results
+  
+  
+#  nonlinear_model_plus <- nls(mean_length ~ a * log(vertices) + d,
+#                              data = mean_table,
+#                              start = list(a = a_initial, d = 0),
+#                              trace = FALSE,
+#                              control = nls.control(maxiter = 10000, minFactor = 1e-15))
+#  
+#  s_4_plus <- c(s_4_plus, round(sqrt(deviance(nonlinear_model_plus)/df.residual(nonlinear_model_plus)),4))
+#  AIC_4_plus <- c(AIC_4_plus, round(AIC(nonlinear_model_plus),2))
+#  a_4_plus <- c(a_4_plus, round(coef(nonlinear_model_plus)["a"],4))
+#  d_4_plus <- c(d_4_plus, round(coef(nonlinear_model_plus)["d"],4))
+#}
+
+```
+
+## m4+
+
+```{r}
+AIC_4_plus <- c()
+s_4_plus <- c()
+a_4_plus <- c()
+d_4_plus <- c()
+BIC_4_plus <- c()
+
+for (lang in languages) {
+  data <- data_list[[lang]]
+  
+  a_init <- a_4[lang]
+  
+  #f_m4 <- a_init * log(data$vertices)
+  #d_init <- mean(data$mean_length - f_m4)
+  
+  m4_plus <- tryCatch(
+    {
+      nlsLM(
+        mean_length ~ a * log(vertices) + d,
+        data = data,
+        start = list(a = a_init, d = 0),
+        control = nls.lm.control(maxiter = 1000)
+      )
+    },
+    error = function(e) {
+      message("nlsLM failed for language: ", lang)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(m4_plus)) {
+    s_4_plus[lang]    <- NA_real_
+    AIC_4_plus[lang]  <- NA_real_
+    a_4_plus[lang]    <- NA_real_
+    d_4_plus[lang]    <- NA_real_
+    BIC_4_plus[lang]  <- NA_real_
+    next
+  }
+  
+  coeffs <- coef(m4_plus)
+  
+  s_4_plus[lang] <- sqrt(deviance(m4_plus)/df.residual(m4_plus))
+  AIC_4_plus[lang] <- AIC(m4_plus)
+  a_4_plus[lang] <- coeffs[1]
+  d_4_plus[lang] <- coeffs[2]
+  BIC_4_plus[lang] <- BIC(m4_plus)
+}
+
+model4_plus_results <- data.frame(
+  Language = names(s_4_plus),
+  s_4_plus = as.numeric(s_4_plus),
+  AIC_4_plus = as.numeric(AIC_4_plus),
+  a_4_plus = as.numeric(a_4_plus),
+  d_4_plus = as.numeric(d_4_plus),
+  BIC_4_plus = as.numeric(BIC_4_plus)
+)
+model4_plus_results
+```
+
+## m5
+
+```{r}
+AIC_5 <- c()
+s_5   <- c()
+a_5   <- c()
+b_5   <- c()
+c_5   <- c()
+BIC_5 <- c()
+
+for (lang in languages) {
+  data <- data_list[[lang]] 
+  
+  lin5 <- lm(log(mean_length) ~ log(vertices) + vertices, data = data)
+  a_init <- exp(coef(lin5)[1])
+  b_init <- coef(lin5)["log(vertices)"]
+  c_init <- coef(lin5)["vertices"]
+  
+  m5 <- tryCatch(
+    {
+      nls(
+        mean_length ~ a * vertices^b * exp(c * vertices),
+        data    = data,
+        start   = list(a = a_init, b = b_init, c = c_init),
+        trace   = FALSE,
+        control = nls.control(maxiter = 100000, minFactor = 1e-10)
+      )
+    },
+    error = function(e) {
+      message("NLS (model 5) failed for language: ", lang)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(m5)) {
+    s_5[lang]   <- NA_real_
+    AIC_5[lang] <- NA_real_
+    a_5[lang]   <- NA_real_
+    b_5[lang]   <- NA_real_
+    c_5[lang]   <- NA_real_
+    BIC_5[lang] <- NA_real_
+    next
+  }
+  
+  s_5[lang]   <- sqrt(deviance(m5) / df.residual(m5))
+  AIC_5[lang] <- AIC(m5)
+  a_5[lang]   <- coef(m5)[["a"]]
+  b_5[lang]   <- coef(m5)[["b"]]
+  c_5[lang]   <- coef(m5)[["c"]]
+  BIC_5[lang] <- BIC(m5)
+}
+
+model5_results <- data.frame(
+  Language = names(s_5),
+  s_5      = as.numeric(s_5),
+  AIC_5    = as.numeric(AIC_5),
+  a_5      = as.numeric(a_5),
+  b_5      = as.numeric(b_5),
+  c_5      = as.numeric(c_5),
+  BIC_5    = as.numeric(BIC_5)
+)
+model5_results
+```
+
+## m5+
+
+```{r}
+AIC_5_plus <- c()
+s_5_plus   <- c()
+a_5_plus   <- c()
+b_5_plus   <- c()
+c_5_plus   <- c()
+d_5_plus   <- c()
+BIC_5_plus <- c()
+
+for (lang in languages) {
+  data <- data_list[[lang]]
+  
+  a_init <- a_5[lang]
+  b_init <- b_5[lang]
+  c_init <- c_5[lang]
+  
+  #f_m5   <- a_init * data$vertices^b_init * exp(c_init * data$vertices)
+  #d_init <- mean(data$mean_length - f_m5)
+  
+  m5_plus <- tryCatch(
+    {
+      m5_plus <- nlsLM(
+      mean_length ~ a * vertices^b * exp(c * vertices) + d,
+      data    = data,
+      start   = list(a = a_init, b = b_init, c = c_init, d = 0),
+      control = nls.lm.control(maxiter = 1000)
+      )
+    },
+    error = function(e) {
+      message("NLS (model 5+) failed for language: ", lang)
+      return(NULL)
+    }
+  )
+  
+  if (is.null(m5_plus)) {
+    s_5_plus[lang]   <- NA_real_
+    AIC_5_plus[lang] <- NA_real_
+    a_5_plus[lang]   <- NA_real_
+    b_5_plus[lang]   <- NA_real_
+    c_5_plus[lang]   <- NA_real_
+    d_5_plus[lang]   <- NA_real_
+    BIC_5_plus[lang] <- NA_real_
+    next
+  }
+  
+  s_5_plus[lang]   <- sqrt(deviance(m5_plus) / df.residual(m5_plus))
+  AIC_5_plus[lang] <- AIC(m5_plus)
+  coeffs <- coef(m5_plus)
+  a_5_plus[lang] <- coeffs[1]
+  b_5_plus[lang] <- coeffs[2]
+  c_5_plus[lang] <- coeffs[3]
+  d_5_plus[lang] <- coeffs[4]
+  BIC_5_plus[lang] <- BIC(m5_plus)
+}
+
+model5_plus_results <- data.frame(
+  Language   = names(s_5_plus),
+  s_5_plus   = as.numeric(s_5_plus),
+  AIC_5_plus = as.numeric(AIC_5_plus),
+  a_5_plus   = as.numeric(a_5_plus),
+  b_5_plus   = as.numeric(b_5_plus),
+  c_5_plus   = as.numeric(c_5_plus),
+  d_5_plus   = as.numeric(d_5_plus),
+  BIC_5_plus = as.numeric(BIC_5_plus)
+)
+model5_plus_results
+```
+
+## AIC Table
+
+```{r}
+tab_aic <- data.frame(
+  languages   = languages,
+  AIC_0      = as.numeric(AIC_0[languages]),
+  AIC_1      = as.numeric(AIC_1[languages]),
+  AIC_2      = as.numeric(AIC_2[languages]),
+  AIC_3      = as.numeric(AIC_3[languages]),
+  AIC_4      = as.numeric(AIC_4[languages]),
+  AIC_5      = as.numeric(AIC_5[languages]),
+  AIC_1_plus = as.numeric(AIC_1_plus[languages]),
+  AIC_2_plus = as.numeric(AIC_2_plus[languages]),
+  AIC_3_plus = as.numeric(AIC_3_plus[languages]),
+  AIC_4_plus = as.numeric(AIC_4_plus[languages]),
+  AIC_5_plus = as.numeric(AIC_5_plus[languages])
+)
+tab_aic
+```
+
+## s Table
+
+```{r}
+tab_s <- data.frame(
+  languages = languages,
+  s_0 = as.numeric(s_0[languages]),
+  s_1 = as.numeric(s_1[languages]),
+  s_2 = as.numeric(s_2[languages]),
+  s_3 = as.numeric(s_3[languages]),
+  s_4 = as.numeric(s_4[languages]),
+  s_5 = as.numeric(s_5[languages]),
+  s_1_plus = as.numeric(s_1_plus[languages]),
+  s_2_plus = as.numeric(s_2_plus[languages]),
+  s_3_plus = as.numeric(s_3_plus[languages]),
+  s_4_plus = as.numeric(s_4_plus[languages]),
+  s_5_plus = as.numeric(s_5_plus[languages])
+)
+tab_s
+```
+
+## ∆ AIC Table
+
+```{r}
+# choose the AIC columns you want to include in Δ (here 2:8 as in your code)
+aic_mat <- as.matrix(tab_aic[, 2:12])
+
+# row-wise minima (per language)
+row_mins <- apply(aic_mat, 1, min, na.rm = TRUE)
+
+# subtract row minima from each row
+delta_mat <- sweep(aic_mat, 1, row_mins, FUN = "-")
+
+# rebuild data frame with languages + ΔAICs
+delta_tab_aic <- data.frame(
+  Language = tab_aic$languages,
+  delta_mat,
+  row.names = NULL
+)
+
+delta_tab_aic
+```
+
+## Parameters table
+
+```{r}
+tab_parameters <- data.frame(
+  languages = languages,
+  b_1 = as.numeric(b_1[languages]),
+  a_2 = as.numeric(a_2[languages]),
+  b_2 = as.numeric(b_2[languages]),
+  a_3 = as.numeric(a_3[languages]),
+  c_3 = as.numeric(c_3[languages]),
+  a_4 = as.numeric(a_4[languages]),
+  a_5 = as.numeric(a_5[languages]),
+  b_5 = as.numeric(b_5[languages]),
+  c_5 = as.numeric(c_5[languages]),
+  b_1_plus = as.numeric(b_1_plus[languages]),
+  d_1_plus = as.numeric(d_1_plus[languages]),
+  a_2_plus = as.numeric(a_2_plus[languages]),
+  b_2_plus = as.numeric(b_2_plus[languages]),
+  d_2_plus = as.numeric(d_2_plus[languages]),
+  a_3_plus = as.numeric(a_3_plus[languages]),
+  c_3_plus = as.numeric(c_3_plus[languages]),
+  d_3_plus = as.numeric(d_3_plus[languages]),
+  a_4_plus = as.numeric(a_4_plus[languages]),
+  d_4_plus = as.numeric(d_4_plus[languages]),
+  a_5_plus = as.numeric(a_5_plus[languages]),
+  b_5_plus = as.numeric(b_5_plus[languages]),
+  c_5_plus = as.numeric(c_5_plus[languages]),
+  d_5_plus = as.numeric(d_5_plus[languages])
+)
+tab_parameters
+```
+
+## BIC table
+
+```{r}
+tab_bic <- data.frame(
+  languages   = languages,
+  BIC_0      = as.numeric(BIC_0[languages]),
+  BIC_1      = as.numeric(BIC_1[languages]),
+  BIC_2      = as.numeric(BIC_2[languages]),
+  BIC_3      = as.numeric(BIC_3[languages]),
+  BIC_4      = as.numeric(BIC_4[languages]),
+  BIC_5      = as.numeric(BIC_5[languages]),
+  BIC_1_plus = as.numeric(BIC_1_plus[languages]),
+  BIC_2_plus = as.numeric(BIC_2_plus[languages]),
+  BIC_3_plus = as.numeric(BIC_3_plus[languages]),
+  BIC_4_plus = as.numeric(BIC_4_plus[languages]),
+  BIC_5_plus = as.numeric(BIC_5_plus[languages])
+)
+tab_bic
+```
+
+## delta BIC table
+
+```{r}
+# choose the AIC columns you want to include in Δ (here 2:8 as in your code)
+bic_mat <- as.matrix(tab_bic[, 2:12])
+
+# row-wise minima (per language)
+row_mins <- apply(bic_mat, 1, min, na.rm = TRUE)
+
+# subtract row minima from each row
+delta_mat <- sweep(bic_mat, 1, row_mins, FUN = "-")
+
+# rebuild data frame with languages + ΔAICs
+delta_tab_bic <- data.frame(
+  Language = tab_bic$languages,
+  delta_mat,
+  row.names = NULL
+)
+
+delta_tab_bic
+```
+
+## Visual comparison of the best model chosen respectively through AIC and BIC for the languages in which the best models differ
+
+```{r}
+plot_best_model <- function(df, lang_label, curve_fun) {
+  df <- df[order(df$vertices), ]
+  df$fit <- curve_fun(df$vertices)
+  
+  df_agg <- aggregate(mean_length ~ vertices, data = df, FUN = mean)
+  
+  ggplot(df, aes(x = vertices, y = mean_length)) +
+    geom_point(alpha = 0.4, size = 0.9) +
+    geom_line(aes(y = fit), colour = "red") +
+    geom_line(data = df_agg, aes(x = vertices, y = mean_length), colour = "green") +
+    scale_x_log10() +
+    scale_y_log10() +
+    labs(
+      title = lang_label,
+      x = "vertices",
+      y = "mean dependency length"
+    ) +
+    theme_minimal(base_size = 10)
+}
+```
+
+### 1) Chinese
+
+```{r}
+# Best model through AIC: Model 2
+# Best model through BIC: Model 1
+
+p1_chinese = plot_best_model(
+  lang_tbl_list[["Chinese"]],
+  "Chinese: Model 2 (AIC)",
+  function(x) a_2["Chinese"] * x^b_2["Chinese"]
+)
+
+p2_chinese = plot_best_model(
+  lang_tbl_list[["Chinese"]],
+  "Chinese: Model 1 (BIC)",
+  function(x) (x/2)^b_1["Chinese"]
+)
+
+p1_chinese + p2_chinese
+```
+
+### 2) German
+
+```{r}
+# Best model through AIC: Model 2+
+# Best model through BIC: Model 2
+
+p1_german = plot_best_model(
+  lang_tbl_list[["German"]],
+  "German: Model 2+ (AIC)",
+  function(x) a_2_plus["German"] * x^b_2_plus["German"] + d_2_plus["German"]
+)
+
+p2_german = plot_best_model(
+  lang_tbl_list[["German"]],
+  "German: Model 2 (BIC)",
+  function(x) a_2["German"] * x^b_2["German"]
+)
+
+p1_german + p2_german
+```
+
+### 3) Hindi
+
+```{r}
+# Best model through AIC: Model 5
+# Best model through BIC: Model 4+
+
+p1_hindi = plot_best_model(
+  lang_tbl_list[["Hindi"]],
+  "Hindi: Model 5 (AIC)",
+  function(x) a_5["Hindi"] * x^b_5["Hindi"] * exp(c_5["Hindi"] * x)
+)
+
+p2_hindi = plot_best_model(
+  lang_tbl_list[["Hindi"]],
+  "Hindi: Model 4+ (BIC)",
+  function(x) a_4_plus["Hindi"] * log(x) + d_4_plus["Hindi"]
+)
+
+p1_hindi + p2_hindi
+```
+
+### 4) Indonesian
+
+```{r}
+# Best model through AIC: Model 5
+# Best model through BIC: Model 4
+
+p1_indonesian = plot_best_model(
+  lang_tbl_list[["Indonesian"]],
+  "Indonesian: Model 5 (AIC)",
+  function(x) a_5["Indonesian"] * x^b_5["Indonesian"] * exp(c_5["Indonesian"] * x)
+)
+
+p2_indonesian = plot_best_model(
+  lang_tbl_list[["Indonesian"]],
+  "Indonesian: Model 4 (BIC)",
+  function(x) a_4["Indonesian"] * log(x)
+)
+
+p1_indonesian + p2_indonesian
+```
+
+### 5) Polish
+
+```{r}
+# Best model through AIC: Model 5+
+# Best model through BIC: Model 5
+
+p1_polish = plot_best_model(
+  lang_tbl_list[["Polish"]],
+  "Polish: Model 5+ (AIC)",
+  function(x) a_5_plus["Polish"] * x^b_5_plus["Polish"] * exp(c_5_plus["Polish"] * x) + d_5_plus["Polish"]
+)
+
+p2_polish = plot_best_model(
+  lang_tbl_list[["Polish"]],
+  "Polish: Model 5 (BIC)",
+  function(x) a_5["Polish"] * x^b_5["Polish"] * exp(c_5["Polish"] * x)
+)
+
+p1_polish + p2_polish
+```
+
+# checking residuals of best models 
+```{r}
+best_models <- delta_tab_aic %>%
+  pivot_longer(
+    cols = starts_with("AIC_"),
+    names_to  = "model",
+    values_to = "delta_AIC"
+  ) %>%
+  group_by(Language) %>%
+  slice_min(delta_AIC, with_ties = FALSE) %>%
+  ungroup()
+
+best_models_bic <- delta_tab_bic %>%
+  pivot_longer(
+    cols = starts_with("BIC_"),
+    names_to  = "model",
+    values_to = "delta_BIC"
+  ) %>%
+  group_by(Language) %>%
+  slice_min(delta_BIC, with_ties = FALSE) %>%
+  ungroup()
+
+best_models
+
+get_best_model_for <- function(lang) {
+  best_models %>%
+    filter(Language == lang) %>%
+    pull(model)
+}
+```
+
+
+```{r}
+predict_best_model <- function(lang, model_name, x,
+                               param_table = tab_parameters) {
+  p <- param_table[param_table$languages == lang, ]
+  if (nrow(p) != 1L) {
+    stop("Could not find unique parameter row for language: ", lang)
+  }
+  p <- as.list(p)
+
+  if (model_name == "AIC_0") {
+    # Model 0: f(n) = (n + 1) / 3
+    f <- (x + 1) / 3
+
+  } else if (model_name == "AIC_1") {
+    # Model 1: f(n) = (n/2)^b
+    f <- (x / 2)^p$b_1
+
+  } else if (model_name == "AIC_2") {
+    # Model 2: f(n) = a n^b
+    f <- p$a_2 * x^p$b_2
+
+  } else if (model_name == "AIC_3") {
+    # Model 3: f(n) = a e^{c n}
+    f <- p$a_3 * exp(p$c_3 * x)
+
+  } else if (model_name == "AIC_4") {
+    # Model 4: f(n) = a log n
+    f <- p$a_4 * log(x)
+
+  } else if (model_name == "AIC_5") {
+    # Model 5: f(n) = a n^b e^{c n}
+    f <- p$a_5 * x^p$b_5 * exp(p$c_5 * x)
+
+  } else if (model_name == "AIC_1_plus") {
+    # Model 1+: f(n) = (n/2)^b + d
+    f <- (x / 2)^p$b_1_plus + p$d_1_plus
+
+  } else if (model_name == "AIC_2_plus") {
+    # Model 2+: f(n) = a n^b + d
+    f <- p$a_2_plus * x^p$b_2_plus + p$d_2_plus
+
+  } else if (model_name == "AIC_3_plus") {
+    # Model 3+: f(n) = a e^{c n} + d
+    f <- p$a_3_plus * exp(p$c_3_plus * x) + p$d_3_plus
+
+  } else if (model_name == "AIC_4_plus") {
+    # Model 4+: f(n) = a log n + d
+    f <- p$a_4_plus * log(x) + p$d_4_plus
+
+  } else if (model_name == "AIC_5_plus") {
+    # Model 5+: f(n) = a n^b e^{c n} + d
+    f <- p$a_5_plus * x^p$b_5_plus * exp(p$c_5_plus * x) + p$d_5_plus
+
+  } else {
+    stop("Unknown model name: ", model_name)
+  }
+
+  return(f)
+}
+
+```
+
+
+```{r}
+compute_residuals_for_lang <- function(lang,
+                                       best_models_tbl = best_models,
+                                       data_list = agg_lang_tbl_list,
+                                       param_table = tab_parameters) {
+  model_name <- best_models_tbl %>%
+    filter(Language == lang) %>%
+    pull(model)
+
+  if (length(model_name) == 0) {
+    stop("No best model found for language: ", lang)
+  }
+
+  df <- data_list[[lang]]
+  stopifnot(all(c("vertices", "mean_length") %in% colnames(df)))
+
+  x <- df$vertices
+  y <- df$mean_length
+
+  fitted_vals <- predict_best_model(lang, model_name, x, param_table)
+
+  df_res <- df
+  df_res$fitted   <- fitted_vals
+  df_res$residual <- y - fitted_vals
+
+  df_res
+}
+
+```
+
+
+```{r}
+plot_best_model_residuals <- function(lang,
+                                      best_models_tbl = best_models,
+                                      data_list = agg_lang_tbl_list,
+                                      param_table = tab_parameters) {
+  df_res <- compute_residuals_for_lang(
+    lang,
+    best_models_tbl = best_models_tbl,
+    data_list       = data_list,
+    param_table     = param_table
+  )
+
+  model_name <- best_models_tbl %>%
+    filter(Language == lang) %>%
+    pull(model)
+
+  p1 <- ggplot(df_res, aes(x = fitted, y = residual)) +
+    geom_hline(yintercept = 0, colour = "grey70") +
+    geom_point(alpha = 0.7) +
+    labs(
+      title = paste0(lang, " – residuals vs fitted (", model_name, ")"),
+      x     = "Fitted values",
+      y     = "Residuals"
+    )
+
+  p2 <- ggplot(df_res, aes(x = vertices, y = residual)) +
+    geom_hline(yintercept = 0, colour = "grey70") +
+    geom_point(alpha = 0.7) +
+    labs(
+      title = paste0(lang, " – residuals vs sentence length (", model_name, ")"),
+      x     = "Sentence length $n$",
+      y     = "Residuals"
+    )
+
+  p1 / p2
+}
+
+```
+
+```{r fig.width=12, fig.height=32}
+langs <- unique(delta_tab_aic$Language)
+plots <- lapply(langs, plot_best_model_residuals)
+wrap_plots(plots, ncol = 3)
+```
+
+```{r fig.width=12, fig.height=32}
+plot_abs_residual_vs_count <- function(
+  lang,
+  best_models_tbl = best_models,
+  raw_list  = lang_tbl_list,
+  agg_list  = agg_lang_tbl_list,
+  param_table = tab_parameters
+) {
+  # 1) Best model name for this language
+  model_name <- best_models_tbl %>%
+    filter(Language == lang) %>%
+    pull(model)
+
+  if (length(model_name) == 0) {
+    stop("No best model found for language: ", lang)
+  }
+
+  # 2) Aggregated data: one row per sentence length n
+  df_agg <- agg_list[[lang]]          # must have columns: vertices, mean_length
+  stopifnot(all(c("vertices", "mean_length") %in% names(df_agg)))
+
+  x_n <- df_agg$vertices
+  y_mean <- df_agg$mean_length
+
+  # 3) Fitted values and residuals (per length)
+  fitted_vals <- predict_best_model(lang, model_name, x_n, param_table)
+  abs_resid   <- abs(y_mean - fitted_vals)
+
+  df_res <- data.frame(
+    vertices      = x_n,
+    mean_abs_res  = abs_resid
+  )
+
+  # 4) Number of sentences per length from RAW data
+  df_raw <- raw_list[[lang]]
+  counts <- df_raw %>%
+    count(vertices, name = "n_points")
+
+  # 5) Join: for each length n, we now have n_points and |residual|
+  df_plot <- df_res %>%
+    inner_join(counts, by = "vertices")
+
+  # 6) Plot: |residual| vs number of sentences per length
+  ggplot(df_plot, aes(x = n_points, y = mean_abs_res)) +
+    geom_point(alpha = 0.8) +
+    # optional smoother, comment out if you don't want it
+    geom_smooth(method = "loess", se = FALSE, colour = "red") +
+    scale_x_log10() +
+    labs(
+      title = paste0(lang, " — |residual| vs. #sentences per length (", model_name, ")"),
+      x     = "Number of sentences for this sentence length (log-scale)",
+      y     = "Absolute residual at mean ⟨d⟩"
+    ) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+}
+langs <- unique(delta_tab_aic$Language)
+plots <- lapply(langs, plot_abs_residual_vs_count)
+wrap_plots(plots, ncol = 3)
+```
+
+```{r}
+compute_abs_residual_vs_count_all <- function(
+  best_models_tbl = best_models,
+  raw_list        = lang_tbl_list,
+  agg_list        = agg_lang_tbl_list,
+  param_table     = tab_parameters
+) {
+  langs <- unique(best_models_tbl$Language)
+
+  df_all <- lapply(langs, function(lang) {
+    model_name <- best_models_tbl %>%
+      filter(Language == lang) %>%
+      pull(model)
+
+    if (length(model_name) == 0) {
+      stop("No best model found for language: ", lang)
+    }
+
+    # aggregated data: one row per sentence length n
+    df_agg <- agg_list[[lang]]
+    stopifnot(all(c("vertices", "mean_length") %in% names(df_agg)))
+
+    x_n    <- df_agg$vertices
+    y_mean <- df_agg$mean_length
+
+    # fitted values + abs residual
+    fitted_vals <- predict_best_model(lang, model_name, x_n, param_table)
+    abs_resid   <- abs(y_mean - fitted_vals)
+
+    df_res <- data.frame(
+      Language     = lang,
+      vertices     = x_n,
+      abs_residual = abs_resid
+    )
+
+    # counts per length from RAW data
+    df_raw <- raw_list[[lang]]
+    counts <- df_raw %>%
+      count(vertices, name = "n_points")
+
+    # join: for each length, we now have n_points + abs_residual
+    df_res %>%
+      inner_join(counts, by = "vertices")
+  })
+
+  bind_rows(df_all)
+}
+
+df_abs_res_all <- compute_abs_residual_vs_count_all()
+
+```
+
+```{r fig.width=8, fig.height=8}
+ggplot(df_abs_res_all, aes(x = n_points, y = abs_residual)) +
+  # all points, all languages
+  geom_point(alpha = 0.3, size = 1) +
+  # light per-language smooth lines
+  geom_smooth(
+    aes(group = Language),
+    method = "loess",
+    se = FALSE,
+    colour = "grey60",
+    alpha = 0.3
+  ) +
+  # one strong smooth line over all languages combined
+  geom_smooth(
+    data   = df_abs_res_all,
+    aes(x = n_points, y = abs_residual),
+    method = "loess",
+    se = FALSE,
+    colour = "red",
+    linewidth = 1.1
+  ) +
+  scale_x_log10() +
+  labs(
+    title = "|Residual| vs. number of sentences per length (all languages)",
+    x     = "Number of sentences for this sentence length (log-scale)",
+    y     = "Absolute residual (best AIC model)"
+  ) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+
+```{r}
+best_models
+```
+
+#best models visualizations
+```{r}
+# Arabic – model 2: a_2 * n^b_2
+p_Arabic <- plot_best_model(
+  lang_tbl_list[["Arabic"]],
+  "Arabic: Model 2",
+  function(x) a_2["Arabic"] * x^b_2["Arabic"]
+)
+
+# Chinese – model 2
+p_Chinese <- plot_best_model(
+  lang_tbl_list[["Chinese"]],
+  "Chinese: Model 2",
+  function(x) a_2["Chinese"] * x^b_2["Chinese"]
+)
+
+# Czech – model 4: a_4 * log n
+p_Czech <- plot_best_model(
+  lang_tbl_list[["Czech"]],
+  "Czech: Model 4",
+  function(x) a_4["Czech"] * log(x)
+)
+
+# English – model 4
+p_English <- plot_best_model(
+  lang_tbl_list[["English"]],
+  "English: Model 4",
+  function(x) a_4["English"] * log(x)
+)
+
+# Finnish – model 4
+p_Finnish <- plot_best_model(
+  lang_tbl_list[["Finnish"]],
+  "Finnish: Model 4",
+  function(x) a_4["Finnish"] * log(x)
+)
+
+# French – model 1+: (n/2)^b_1_plus + d_1_plus
+p_French <- plot_best_model(
+  lang_tbl_list[["French"]],
+  "French: Model 1+",
+  function(x) (x/2)^b_1_plus["French"] + d_1_plus["French"]
+)
+
+# Galician – model 2
+p_Galician <- plot_best_model(
+  lang_tbl_list[["Galician"]],
+  "Galician: Model 2",
+  function(x) a_2["Galician"] * x^b_2["Galician"]
+)
+
+# German – model 2+: a_2_plus * n^b_2_plus + d_2_plus
+p_German <- plot_best_model(
+  lang_tbl_list[["German"]],
+  "German: Model 2",
+  function(x) a_2_plus["German"] * x^b_2_plus["German"] + d_2_plus["German"]
+)
+
+# Hindi – model 5: a_5 * n^b_5 * exp(c_5 * n)
+p_Hindi <- plot_best_model(
+  lang_tbl_list[["Hindi"]],
+  "Hindi: Model 5",
+  function(x) a_5["Hindi"] * x^b_5["Hindi"] * exp(c_5["Hindi"] * x)
+)
+
+# Icelandic – model 5
+p_Icelandic <- plot_best_model(
+  lang_tbl_list[["Icelandic"]],
+  "Icelandic: Model 5",
+  function(x) a_5["Icelandic"] * x^b_5["Icelandic"] * exp(c_5["Icelandic"] * x)
+)
+
+# Indonesian – model 5
+p_Indonesian <- plot_best_model(
+  lang_tbl_list[["Indonesian"]],
+  "Indonesian: Model 5",
+  function(x) a_5["Indonesian"] * x^b_5["Indonesian"] * exp(c_5["Indonesian"] * x)
+)
+
+# Italian – model 2
+p_Italian <- plot_best_model(
+  lang_tbl_list[["Italian"]],
+  "Italian: Model 2",
+  function(x) a_2["Italian"] * x^b_2["Italian"]
+)
+
+# Japanese – model 4
+p_Japanese <- plot_best_model(
+  lang_tbl_list[["Japanese"]],
+  "Japanese: Model 4",
+  function(x) a_4["Japanese"] * log(x)
+)
+
+# Korean – model 1: (n/2)^b_1
+p_Korean <- plot_best_model(
+  lang_tbl_list[["Korean"]],
+  "Korean: Model 1",
+  function(x) (x/2)^b_1["Korean"]
+)
+
+# Polish – model 5+: a_5_plus * n^b_5_plus * exp(c_5_plus * n) + d_5_plus
+p_Polish <- plot_best_model(
+  lang_tbl_list[["Polish"]],
+  "Polish: Model 5+",
+  function(x) a_5_plus["Polish"] * x^b_5_plus["Polish"] * exp(c_5_plus["Polish"] * x) + d_5_plus["Polish"]
+)
+
+# Portuguese – model 4
+p_Portuguese <- plot_best_model(
+  lang_tbl_list[["Portuguese"]],
+  "Portuguese: Model 4",
+  function(x) a_4["Portuguese"] * log(x)
+)
+
+# Russian – model 4
+p_Russian <- plot_best_model(
+  lang_tbl_list[["Russian"]],
+  "Russian: Model 4",
+  function(x) a_4["Russian"] * log(x)
+)
+
+# Spanish – model 4
+p_Spanish <- plot_best_model(
+  lang_tbl_list[["Spanish"]],
+  "Spanish: Model 4",
+  function(x) a_4["Spanish"] * log(x)
+)
+
+# Swedish – model 5
+p_Swedish <- plot_best_model(
+  lang_tbl_list[["Swedish"]],
+  "Swedish: Model 5",
+  function(x) a_5["Swedish"] * x^b_5["Swedish"] * exp(c_5["Swedish"] * x)
+)
+
+# Thai – model 4+: a_4_plus * log n + d_4_plus
+p_Thai <- plot_best_model(
+  lang_tbl_list[["Thai"]],
+  "Thai: Model 4+",
+  function(x) a_4_plus["Thai"] * log(x) + d_4_plus["Thai"]
+)
+
+# Turkish – model 1
+p_Turkish <- plot_best_model(
+  lang_tbl_list[["Turkish"]],
+  "Turkish: Model 1",
+  function(x) (x/2)^b_1["Turkish"]
+)
+
+```
+
+```{r, fig.width=10, fig.height=18}
+plot_list <- list(
+  p_Arabic, p_Chinese, p_Czech, p_English,
+  p_Finnish, p_French, p_Galician, p_German,
+  p_Hindi, p_Icelandic, p_Indonesian, p_Italian,
+  p_Japanese, p_Korean, p_Polish, p_Portuguese,
+  p_Russian, p_Spanish, p_Swedish, p_Thai, p_Turkish
+)
+
+wrap_plots(plot_list, ncol = 4)
+```
+
+
+# summary vs model choice
+
+```{r}
+library(dplyr)
+
+files <- list.files("data")
+
+summary_df <- data.frame()
+lang_tbl_list <- list()
+
+for (file in files) {
+  lang_tbl <- read.table(paste0("./data/", file), header = FALSE)
+  colnames(lang_tbl) <- c("vertices", "degree_2nd_moment", "mean_length")
+  lang <- sub("_.*", "", file)
+  lang_tbl_list[[lang]] <- lang_tbl[order(lang_tbl$vertices), ]
+  
+  N     <- nrow(lang_tbl)
+  mu_n  <- mean(lang_tbl$vertices)
+  std_n <- sd(lang_tbl$vertices)
+  
+  mu_d  <- mean(lang_tbl$mean_length)
+  std_d <- sd(lang_tbl$mean_length)
+  
+  summary_df <- rbind(summary_df, c(lang, N, mu_n, std_n, mu_d, std_d))
+}
+
+colnames(summary_df) <- c("Language", "N", "mu_n", "std_n", "mu_d", "std_d")
+
+summary_df <- summary_df %>%
+  mutate(
+    N     = as.numeric(N),
+    mu_n  = as.numeric(mu_n),
+    std_n = as.numeric(std_n),
+    mu_d  = as.numeric(mu_d),
+    std_d = as.numeric(std_d)
+  )
+
+
+summary_with_model <- summary_df %>%
+  left_join(best_models, by = "Language") %>%
+  rename(AIC_model = model)
+
+```
+
+
+
+```{r}
+
+
+ggplot(summary_with_model,
+       aes(x = mu_n, y = mu_d, colour = AIC_model)) +
+  geom_point(size = 3) +
+  # ggrepel::geom_text_repel(aes(label = Language), size = 3) +
+  labs(
+    title = "Summary statistics vs. selected AIC-best model",
+    x     = "Mean sentence length $\\mu_n$",
+    y     = "Mean dependency length $\\mu_{\\langle d \\rangle}$",
+    colour = "AIC-best model"
+  ) +
+  theme_bw()
+
+```
+
+```{r}
+ggplot(summary_with_model, aes(x = AIC_model)) +
+  geom_bar(colour = "black", fill = "black") +
+  labs(
+    title = "Number of languages per AIC-best model",
+    x     = "AIC-best model",
+    y     = "Count of languages"
+  ) +
+  theme_bw()
+
+```
+
+```{r}
+summary_df <- summary_df %>%
+  mutate(
+    mu_n  = as.numeric(mu_n),
+    std_n = as.numeric(std_n),
+    mu_d  = as.numeric(mu_d),
+    std_d = as.numeric(std_d)
+  )
+
+
+summary_with_model <- summary_df %>%
+  left_join(best_models, by = "Language") %>%
+  rename(AIC_model = model)
+
+summary_with_model <- summary_with_model %>%
+  select(Language, AIC_model, mu_n, std_n, mu_d, std_d)
+
+summary_scaled <- summary_with_model %>%
+  mutate(
+    across(
+      c(mu_n, std_n, mu_d, std_d),
+      ~ (.-min(., na.rm = TRUE)) / (max(., na.rm = TRUE) - min(., na.rm = TRUE)),
+      .names = "{.col}_scaled"
+    )
+  )
+
+summary_long <- summary_scaled %>%
+  select(Language, AIC_model,
+         mu_n_scaled, std_n_scaled, mu_d_scaled, std_d_scaled) %>%
+  pivot_longer(
+    cols      = ends_with("_scaled"),
+    names_to  = "stat",
+    values_to = "value_scaled"
+  ) %>%
+  mutate(
+    # nicer stat labels
+    stat = recode(stat,
+                  "mu_n_scaled"  = "mean sentence length",
+                  "std_n_scaled" = "sd sentence length",
+                  "mu_d_scaled"  = "mean dependency length",
+                  "std_d_scaled" = "sd dependency length"),
+    # optional: nicer model labels (remove "AIC_" prefix)
+    Model = gsub("^AIC_", "Model ", AIC_model)
+  )
+
+```
+
+```{r}
+ggplot(summary_long,
+       aes(x = Model, y = value_scaled, colour = stat)) +
+  geom_point(position = position_jitter(width = 0.2, height = 0), size = 2) +
+  labs(
+    title = "Standardized summary statistics by chosen AIC-best model",
+    x     = "Chosen model (AIC-best)",
+    y     = "Standardized value (scaled to [0,1])",
+    colour = "Statistic"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+```{r}
+labels_df <- best_models %>%
+  group_by(model) %>%
+  summarise(
+    n_lang   = n(),
+    langs_lab = paste(Language, collapse = "\n"),  # line break between langs
+    .groups = "drop"
+  )
+
+ggplot(best_models, aes(x = model)) +
+  geom_bar(colour = "black", fill = "black") +
+  # add language names inside bars
+  geom_text(
+    data = labels_df,
+    aes(x = model, y = n_lang / 2, label = langs_lab),
+    colour = "white",
+    size   = 3,
+    lineheight = 0.9
+  ) +
+  labs(
+    title = "Number of languages per AIC-best model",
+    x     = "AIC-best model",
+    y     = "Count of languages"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+

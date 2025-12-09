@@ -1,0 +1,6 @@
+Model	Performance on ER graph (seconds)	Performance on switching model graph (seconds)
+Harmonic Centrality (igraph)	0.382766962051392	0.359624862670898
+Approximated Manual BFS	0.709634065628052	0.601946115493774
+Exact Manual with Cache	5.19723606109619	5.33880400657654
+Exact Manual with M Threshold	5.19278597831726	6.03214001655579
+Exact Manual with Cache and M	4.19898700714111	5.45836305618286

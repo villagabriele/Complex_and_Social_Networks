@@ -14,3 +14,4 @@ The labs cover several topics regarding Social Networks and their analysis. In p
 - LAB 04: Non-linear regression on dependency trees (with Johannes Weinert)
 - LAB 05: Network dynamics (with Davide Volpi)
 - LAB 06: Finding and assessing community structure (with Domenico Azzarito)
+- LAB 07: Epidemic spreading over networks (with Virginia Nicosia)

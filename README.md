@@ -2,7 +2,7 @@
 Homework carried out for the Complex and Social Networks course, Master's degree in Data Science, Universitat Politècnica de Catalunya, Academic Year 2025-26.
 
 ## Structure of the repository
-For every lab there's a pdf file named instructions_labXX.pdf with the instructions for the homework, a pdf file named report.pdf with the report of the homework, and the code itself. In some of the folders I avoided uploading some plots or the original data (the PUD database) because they were way too big. However, the necessary plots are shown in the reports and the PUD database can be easily accessed online.
+For every lab there's a pdf file named `instructions_labXX.pdf` with the instructions for the homework, a pdf file named `report.pdf` with the report of the homework, and the code itself. In some of the folders I avoided uploading some plots or the original data (the PUD database) because they were way too big. However, the necessary plots are shown in the reports and the PUD database can be easily accessed online.
 
 Every homework was carried out in pairs (a different mate was chosen at every session).
 

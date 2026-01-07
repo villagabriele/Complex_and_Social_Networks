@@ -1,0 +1,290 @@
+---
+title: "LAB 07 CSN"
+author: "Virginia Nicosia, Gabriele Villa"
+date: "2025-12-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Importing necessary library and setting the seed
+
+```{r}
+library(igraph)
+library(Matrix)
+library(knitr)
+library(RSpectra)
+
+set.seed(123)
+```
+
+# Setting the parameters
+
+```{r}
+n <- 1000
+p0 <- 0.05
+gamma <- 0.4
+Tmax <- 200
+```
+
+# Helper functions
+
+## Compute smart y-axis limits
+
+```{r}
+compute_ylim <- function(x, y, padding = 0.05) {
+  ymin <- min(c(x, y))
+  ymax <- max(c(x, y))
+  range <- ymax - ymin
+  c(
+    max(0, ymin - padding * range),
+    min(1, ymax + padding * range)
+  )
+}
+```
+
+## Fast SIS simulation
+
+```{r}
+simulate_SIS_fast <- function(g, beta, gamma, p0, Tmax) {
+  n <- vcount(g)
+  A <- as_adj(g, sparse = TRUE)
+  
+  x <- rbinom(n, 1, p0)
+  infected_frac <- numeric(Tmax)
+  
+  for (t in 1:Tmax) {
+    k <- as.vector(A %*% x)
+    
+    # numerically stable infection probability
+    p_infect <- 1 - (1 - beta)^k
+    p_infect[is.na(p_infect)] <- 1
+    p_infect[p_infect > 1] <- 1
+    p_infect[p_infect < 0] <- 0
+    
+    recover <- rbinom(n, 1, gamma)
+    
+    x_new <- x
+    x_new[x == 1 & recover == 1] <- 0
+    
+    sus <- which(x == 0)
+    if (length(sus) > 0) {
+      x_new[sus] <- rbinom(length(sus), 1, p_infect[sus])
+    }
+    
+    x <- x_new
+    infected_frac[t] <- mean(x)
+  }
+  
+  infected_frac
+}
+```
+
+## Leading eigenvalue
+
+```{r}
+leading_eigenvalue <- function(g) {
+  A <- as_adj(g, sparse = TRUE)
+  eigs_sym(A, k = 1, which = "LA")$values[1]
+}
+```
+
+## Save table
+
+```{r}
+save_table <- function(tbl, filename, caption = NULL) {
+  if (!dir.exists("tables")) dir.create("tables")
+  
+  if (is.matrix(tbl)) {
+    df <- as.data.frame(tbl)
+    df <- cbind(Network = rownames(tbl), df)
+  } else {
+    df <- tbl
+  }
+  
+  latex_code <- kable(
+    df,
+    format = "latex",
+    digits = 4,
+    booktabs = TRUE,
+    caption = caption,
+    row.names = FALSE
+  )
+  
+  cat(latex_code, file = file.path("tables", filename))
+}
+```
+
+## Plot Task 1
+
+```{r}
+save_time_series_plot <- function(results, title, filename, colors) {
+  if (!dir.exists("figures")) dir.create("figures")
+  
+  png(file.path("figures", filename), width = 900, height = 700)
+  
+  plot(
+    results[[1]],
+    type = "l",
+    ylim = c(0, 1),
+    col = colors[names(results)[1]],
+    lwd = 2,
+    xlab = "Time",
+    ylab = "Fraction infected",
+    main = title
+  )
+  
+  for (name in names(results)[-1]) {
+    lines(results[[name]], col = colors[name], lwd = 2)
+  }
+  
+  legend(
+    "topright",
+    legend = names(results),
+    col = colors[names(results)],
+    lwd = 2,
+    bty = "n"
+  )
+  
+  dev.off()
+}
+```
+
+## Plot Task 2
+
+```{r}
+save_task2_network_plot <- function(res_below, res_above,
+                                    network_name, filename) {
+  if (!dir.exists("figures")) dir.create("figures")
+  
+  # Compute ylim but ensure we can see 0
+  ylim <- compute_ylim(res_below, res_above)
+  ylim[1] <- 0 # Always anchor at 0 for SIS
+  
+  png(file.path("figures", filename), width = 900, height = 700)
+  
+  plot(
+    res_below,
+    type = "l",
+    col = "red",
+    lwd = 2,
+    ylim = ylim,
+    xlab = "Time",
+    ylab = "Fraction infected",
+    main = paste("SIS dynamics on", network_name)
+  )
+  
+  # Add grid for readability
+  grid(nx = NULL, ny = NULL, col = "lightgray", lty = "dotted")
+  
+  lines(
+    res_above,
+    col = "darkgreen",
+    lwd = 2
+  )
+  
+  legend(
+    "topright",
+    legend = c("Below threshold", "Above threshold"),
+    col = c("red", "darkgreen"),
+    lwd = 2,
+    bg = "white" 
+  )
+  
+  dev.off()
+}
+```
+
+## Network generation
+
+```{r}
+networks <- list(
+  ER        = erdos.renyi.game(n, p = 0.01, type = "gnp"),
+  BA        = barabasi.game(n, m = 3, directed = FALSE),
+  WS        = watts.strogatz.game(1, n, nei = 5, p = 0.1),
+  Complete  = make_full_graph(n),
+  Tree      = make_tree(n, mode = "undirected"),
+  Star      = make_star(n, mode = "undirected"),
+  Lattice   = make_lattice(c(31, 32), nei = 1, circular = FALSE)
+)
+
+network_colors <- c(
+  ER       = "#1b9e77",
+  BA       = "#d95f02",
+  WS       = "#7570b3",
+  Complete = "#e7298a",
+  Tree     = "#66a61e",
+  Star     = "#e6ab02",
+  Lattice  = "#a6761d"
+)
+
+
+# THRESHOLDS
+lambda1 <- sapply(networks, leading_eigenvalue)
+beta_c <- gamma / lambda1
+
+threshold_table <- data.frame(
+  Network = names(lambda1),
+  Lambda1 = lambda1,
+  Beta_c  = beta_c
+)
+
+save_table(
+  threshold_table,
+  "thresholds.tex",
+  caption = "Leading eigenvalue and SIS epidemic threshold"
+)
+```
+
+# Task 1
+
+```{r}
+beta_fixed <- 0.6
+results_task1 <- list()
+
+for (name in names(networks)) {
+  results_task1[[name]] <- simulate_SIS_fast(
+    networks[[name]],
+    beta = beta_fixed,
+    gamma = gamma,
+    p0 = p0,
+    Tmax = Tmax
+  )
+}
+
+# All networks
+save_time_series_plot(
+  results_task1,
+  "SIS spreading (fixed beta)",
+  "task1_sis_all_networks.png",
+  network_colors
+)
+```
+
+# Task 2
+
+```{r}
+results_task2 <- list()
+
+for (name in names(networks)) {
+  beta_below <- 0.9 * beta_c[name]
+  beta_above <- 1.1 * beta_c[name]
+  
+  res_below <- simulate_SIS_fast(
+    networks[[name]], beta_below, gamma, p0, Tmax
+  )
+  
+  res_above <- simulate_SIS_fast(
+    networks[[name]], beta_above, gamma, p0, Tmax
+  )
+  
+  save_task2_network_plot(
+    res_below,
+    res_above,
+    network_name = name,
+    filename = paste0("task2_", name, "_threshold.png")
+  )
+}
+```
